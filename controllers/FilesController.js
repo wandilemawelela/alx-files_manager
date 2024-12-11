@@ -5,6 +5,7 @@ import fs from 'fs';
 import mime from 'mime-types';
 import { v4 as uuidv4 } from 'uuid';
 import sha1 from 'sha1';
+import { fileQueue } from '../queues/fileQueue';
 
 class FilesController {
   static async postUpload(req, res) {
@@ -56,9 +57,18 @@ class FilesController {
       file.localPath = localPath;
     }
 
-    await dbClient.db.collection('files').insertOne(file);
+    const result = await dbClient.db.collection('files').insertOne(file);
+
+    // If the file is an image, add a job to the queue for thumbnail generation
+    if (type === 'image') {
+      fileQueue.add({
+        userId: file.userId.toString(),
+        fileId: result.insertedId.toString(),
+      });
+    }
+
     return res.status(201).json({
-      id: file._id,
+      id: result.insertedId,
       userId: file.userId,
       name: file.name,
       type: file.type,
@@ -68,82 +78,9 @@ class FilesController {
     });
   }
 
-  static async getShow(req, res) {
-    const token = req.headers['x-token'];
-    const userId = await redisClient.get(`auth_${token}`);
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { id } = req.params;
-    const file = await dbClient.db.collection('files').findOne({ _id: ObjectId(id), userId: ObjectId(userId) });
-
-    if (!file) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-
-    return res.json(file);
-  }
-
-  static async getIndex(req, res) {
-    const token = req.headers['x-token'];
-    const userId = await redisClient.get(`auth_${token}`);
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { parentId = 0, page = 0 } = req.query;
-    const files = await dbClient.db.collection('files').aggregate([
-      { $match: { userId: ObjectId(userId), parentId: parentId === 0 ? 0 : ObjectId(parentId) } },
-      { $skip: page * 20 },
-      { $limit: 20 }
-    ]).toArray();
-
-    return res.json(files);
-  }
-
-  static async putPublish(req, res) {
-    const token = req.headers['x-token'];
-    const userId = await redisClient.get(`auth_${token}`);
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { id } = req.params;
-    const file = await dbClient.db.collection('files').findOne({ _id: ObjectId(id), userId: ObjectId(userId) });
-
-    if (!file) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-
-    await dbClient.db.collection('files').updateOne({ _id: ObjectId(id) }, { $set: { isPublic: true } });
-    return res.status(200).json({ ...file, isPublic: true });
-  }
-
-  static async putUnpublish(req, res) {
-    const token = req.headers['x-token'];
-    const userId = await redisClient.get(`auth_${token}`);
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { id } = req.params;
-    const file = await dbClient.db.collection('files').findOne({ _id: ObjectId(id), userId: ObjectId(userId) });
-
-    if (!file) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-
-    await dbClient.db.collection('files').updateOne({ _id: ObjectId(id) }, { $set: { isPublic: false } });
-    return res.status(200).json({ ...file, isPublic: false });
-  }
-
   static async getFile(req, res) {
     const { id } = req.params;
+    const { size = 500 } = req.query;  // Get the size query parameter
     const file = await dbClient.db.collection('files').findOne({ _id: ObjectId(id) });
 
     if (!file) {
@@ -158,13 +95,16 @@ class FilesController {
       return res.status(400).json({ error: "A folder doesn't have content" });
     }
 
-    if (!fs.existsSync(file.localPath)) {
+    // Check if the requested size thumbnail exists
+    const thumbnailPath = `${file.localPath.replace(/(\.\w+)$/, `_${size}$1`)}`;
+
+    if (!fs.existsSync(thumbnailPath)) {
       return res.status(404).json({ error: 'Not found' });
     }
 
     const mimeType = mime.lookup(file.name);
     res.setHeader('Content-Type', mimeType);
-    fs.createReadStream(file.localPath).pipe(res);
+    fs.createReadStream(thumbnailPath).pipe(res);
   }
 }
 
